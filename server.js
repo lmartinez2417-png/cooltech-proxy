@@ -2,7 +2,7 @@ const express = require('express');
 const cors = require('cors');
 
 const app = express();
-const PORT = process.env.PORT || 3000;
+const PORT = process.env.PORT || 8080;
 const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
 
 app.use(cors());
