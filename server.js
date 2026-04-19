@@ -304,6 +304,17 @@ app.post('/ai', verifyAuth, burstLimiter, freeLimiter, async (req, res) => {
       });
     }
 
+    // Usage log — one line per successful diagnosis for DAU/volume analysis.
+    // Keyed by Firebase UID (hashed prefix only, so raw UID never lands in logs).
+    // Grep Railway logs for `DIAG` to count.
+    const uidHash = req.uid ? String(req.uid).slice(0, 8) : 'anon';
+    console.log('DIAG', JSON.stringify({
+      ts: new Date().toISOString(),
+      uid: uidHash,
+      in: data.usage?.input_tokens,
+      out: data.usage?.output_tokens
+    }));
+
     // Return only what the client needs (strip metadata)
     res.json({
       content: data.content,
