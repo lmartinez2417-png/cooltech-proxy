@@ -138,35 +138,69 @@ if (process.env.REDIS_URL) {
 }
 
 // ═══════════════════════════════════════
-// RATE LIMITING — THIS IS THE BIG ONE
+// RATE LIMITING — TRIAL-AWARE
 // ═══════════════════════════════════════
+// Model: 7-day full trial (unlimited) → then N free diagnoses / 30-day rolling
+// window. "First seen" timestamp per UID is tracked in-memory (acceptable for
+// v1 — a proxy restart grants an extra trial; real users won't farm it).
 
-// Free tier: 3 requests per IP per 24 hours
-const FREE_LIMIT = parseInt(process.env.RATE_LIMIT_FREE) || 3;
+const TRIAL_DAYS = parseInt(process.env.TRIAL_DAYS) || 7;
+const FREE_MONTHLY = parseInt(process.env.FREE_MONTHLY) || 3;
+
+// Legacy env alias — keep so existing Railway var doesn't blow up
+const FREE_LIMIT = FREE_MONTHLY;
 
 // Use Firebase UID if authenticated (fair per-user limiting), fall back to IP
 const userKey = (req) => req.uid || req.ip;
 
+// Track first-seen timestamp per UID to anchor the trial window.
+// In-memory — resets on deploy. TODO: persist to Redis when we expose the client.
+const firstSeen = new Map();
+function getTrialStart(uid) {
+  if (!uid) return null;
+  if (!firstSeen.has(uid)) firstSeen.set(uid, Date.now());
+  return firstSeen.get(uid);
+}
+function msSinceTrialStart(uid) {
+  const start = getTrialStart(uid);
+  return start ? Date.now() - start : 0;
+}
+function isInTrial(uid) {
+  return msSinceTrialStart(uid) < TRIAL_DAYS * 24 * 60 * 60 * 1000;
+}
+function trialDaysLeft(uid) {
+  const ms = TRIAL_DAYS * 24 * 60 * 60 * 1000 - msSinceTrialStart(uid);
+  return Math.max(0, Math.ceil(ms / (24 * 60 * 60 * 1000)));
+}
+
+// Expose trial+quota status on every /ai response via headers.
+function attachTrialHeaders(req, res) {
+  if (!req.uid) return;
+  res.setHeader('X-Trial-Days-Left', String(trialDaysLeft(req.uid)));
+  res.setHeader('X-Trial-Active', isInTrial(req.uid) ? '1' : '0');
+}
+
 const freeLimiter = rateLimit({
-  windowMs: 24 * 60 * 60 * 1000,   // 24 hours
-  max: FREE_LIMIT,                   // requests per window (default 3)
-  standardHeaders: true,             // Return rate limit info in headers
+  windowMs: 30 * 24 * 60 * 60 * 1000,   // 30-day rolling window
+  max: FREE_MONTHLY,                      // N free looks after trial ends
+  standardHeaders: true,                  // Return rate limit info in headers
   legacyHeaders: false,
   ...(redisStore && { store: redisStore }),
   keyGenerator: userKey,
   handler: (req, res) => {
+    attachTrialHeaders(req, res);
     res.status(429).json({
       error: {
-        message: `Daily limit reached (${FREE_LIMIT} free diagnoses). Upgrade to Pro for unlimited access.`,
-        type: 'rate_limit_exceeded',
+        message: `You've used your ${FREE_MONTHLY} free diagnoses this month. Upgrade for unlimited.`,
+        type: 'monthly_limit_reached',
         upgrade_url: process.env.STRIPE_PAYMENT_LINK || null
       }
     });
   },
   skip: (req) => {
-    // Authenticated users get rate-limited by UID instead of IP (handled below).
-    // TODO: Skip rate limiting entirely for paid/subscribed users.
-    // Example: return req.isPaidUser === true;
+    // Skip the monthly limiter entirely for users still inside their trial.
+    // TODO: Also skip for paid/subscribed users (check Firebase custom claim).
+    if (req.uid && isInTrial(req.uid)) return true;
     return false;
   }
 });
@@ -311,9 +345,13 @@ app.post('/ai', verifyAuth, burstLimiter, freeLimiter, async (req, res) => {
     console.log('DIAG', JSON.stringify({
       ts: new Date().toISOString(),
       uid: uidHash,
+      trial: isInTrial(req.uid) ? 1 : 0,
       in: data.usage?.input_tokens,
       out: data.usage?.output_tokens
     }));
+
+    // Expose trial status so client can render "3 days left in trial" etc.
+    attachTrialHeaders(req, res);
 
     // Return only what the client needs (strip metadata)
     res.json({
