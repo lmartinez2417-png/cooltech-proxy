@@ -298,7 +298,7 @@ app.post('/ai', verifyAuth, burstLimiter, freeLimiter, async (req, res) => {
     const data = await response.json();
 
     if (!response.ok) {
-      console.error('Anthropic API error:', { status: response.status, type: data?.error?.type, message: data?.error?.message });
+      console.error('Anthropic API error:', { status: response.status, type: data?.error?.type });
       return res.status(response.status).json({
         error: { message: data.error?.message || 'AI service error. Try again.' }
       });
