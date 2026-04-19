@@ -16,7 +16,7 @@ git push -u origin main
 ### Step 2: Deploy on Railway
 1. Go to https://railway.app
 2. Click **New Project** → **Deploy from GitHub repo**
-3. Select your `cooltech-proxy` repo
+3. Select your `fixit-ai-proxy` repo
 4. Railway auto-detects Node.js and runs `npm start`
 
 ### Step 3: Set Environment Variables
@@ -25,12 +25,12 @@ In Railway dashboard → your service → **Variables** tab:
 | Variable | Value | Required |
 |----------|-------|----------|
 | `ANTHROPIC_API_KEY` | `sk-ant-api03-...` | YES |
-| `RATE_LIMIT_FREE` | `5` | No (default: 5) |
+| `RATE_LIMIT_FREE` | `3` | No (default: 3) |
 | `STRIPE_PAYMENT_LINK` | `https://buy.stripe.com/...` | No (add when ready) |
 | `ALLOWED_ORIGINS` | `https://yourdomain.com` | No (default: all) |
 
 ### Step 4: Update Your App
-Once deployed, Railway gives you a URL like `https://cooltech-proxy-production-XXXX.up.railway.app`
+Once deployed, Railway gives you a URL like `https://fixit-ai-proxy-production-XXXX.up.railway.app`
 
 Update the PROXY constant in your `index.html`:
 ```javascript
@@ -42,10 +42,10 @@ Once the new one is working, delete the old Railway service to avoid confusion.
 
 ## What This Proxy Does
 
-- **Rate limits**: 5 requests/day per IP (free tier), 3 requests/minute (burst protection)
+- **Rate limits**: 3 requests/day per IP (free tier), 3 requests/minute (burst protection)
 - **Input validation**: Max 10K chars text, max 5 images, max 2000 tokens
 - **Model lock**: Only allows Claude Sonnet (prevents model switching attacks)
-- **Size limit**: 500KB max request body (prevents text bombs)
+- **Size limit**: 2MB max request body (prevents text bombs; fits ~5 images)
 - **Security headers**: Helmet.js adds standard security headers
 - **CORS**: Configurable allowed origins
 - **Cost control**: Caps max_tokens at 2000 per request
@@ -53,6 +53,6 @@ Once the new one is working, delete the old Railway service to avoid confusion.
 ## Testing Locally
 ```bash
 npm install
-ANTHROPIC_API_KEY=sk-ant-... node server.js
+ANTHROPIC_API_KEY=sk-ant-... FIREBASE_PROJECT_ID=your-project-id node server.js
 # Then: curl -X POST http://localhost:3000/ai -H "Content-Type: application/json" -d '{"system":"test","messages":[{"role":"user","content":[{"type":"text","text":"hello"}]}]}'
 ```

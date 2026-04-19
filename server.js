@@ -15,8 +15,8 @@
  * Environment variables:
  *   ANTHROPIC_API_KEY   — Required. Your Anthropic API key.
  *   PORT                — Optional. Railway sets this automatically.
- *   RATE_LIMIT_FREE     — Optional. Max requests per IP per day (default: 5)
- *   ALLOWED_ORIGINS     — Optional. Comma-separated origins (default: *)
+ *   RATE_LIMIT_FREE     — Optional. Max requests per IP per day (default: 3)
+ *   ALLOWED_ORIGINS     — Optional. Comma-separated origins (default: capacitor://localhost, https://localhost, http://localhost:3333)
  *   STRIPE_PAYMENT_LINK — Optional. Your Stripe payment URL for upgrades.
  *   REDIS_URL           — Optional. Redis connection URL for persistent rate limiting.
  *                          If not set, falls back to in-memory (resets on deploy/restart).
@@ -40,10 +40,18 @@ const PORT = process.env.PORT || 3000;
 // Basic security headers
 app.use(helmet());
 
-// CORS — restrict to your domains in production
+// CORS — restrict to your domains in production.
+// Set ALLOWED_ORIGINS on Railway to override this list (comma-separated).
+// Defaults cover: Capacitor native apps, localhost dev, and current production web origins.
 const allowedOrigins = process.env.ALLOWED_ORIGINS
   ? process.env.ALLOWED_ORIGINS.split(',').map(o => o.trim())
-  : ['capacitor://localhost', 'https://localhost', 'http://localhost:3333'];
+  : [
+      'capacitor://localhost',
+      'https://localhost',
+      'http://localhost:3333',
+      'https://animated-tapioca-b59102.netlify.app',
+      'https://deploy-zeta-sage.vercel.app'
+    ];
 
 app.use(cors({
   origin: allowedOrigins.includes('*') ? true : allowedOrigins,
@@ -54,8 +62,9 @@ app.use(cors({
 // Trust first proxy (Railway) so req.ip is the real client IP
 app.set('trust proxy', 1);
 
-// Parse JSON with size limit (prevents text bombs)
-app.use(express.json({ limit: '5mb' }));
+// Parse JSON with size limit (prevents text bombs).
+// 2MB is enough for ~5 photos at 1200×1200 base64-encoded; images are pre-compressed client-side.
+app.use(express.json({ limit: '2mb' }));
 
 // ═══════════════════════════════════════
 // FIREBASE AUTH (token verification)
@@ -132,7 +141,7 @@ if (process.env.REDIS_URL) {
 // RATE LIMITING — THIS IS THE BIG ONE
 // ═══════════════════════════════════════
 
-// Free tier: 5 requests per IP per 24 hours
+// Free tier: 3 requests per IP per 24 hours
 const FREE_LIMIT = parseInt(process.env.RATE_LIMIT_FREE) || 3;
 
 // Use Firebase UID if authenticated (fair per-user limiting), fall back to IP
@@ -140,7 +149,7 @@ const userKey = (req) => req.uid || req.ip;
 
 const freeLimiter = rateLimit({
   windowMs: 24 * 60 * 60 * 1000,   // 24 hours
-  max: FREE_LIMIT,                   // 5 requests per window
+  max: FREE_LIMIT,                   // requests per window (default 3)
   standardHeaders: true,             // Return rate limit info in headers
   legacyHeaders: false,
   ...(redisStore && { store: redisStore }),
@@ -289,7 +298,7 @@ app.post('/ai', verifyAuth, burstLimiter, freeLimiter, async (req, res) => {
     const data = await response.json();
 
     if (!response.ok) {
-      console.error('Anthropic API error:', data);
+      console.error('Anthropic API error:', { status: response.status, type: data?.error?.type, message: data?.error?.message });
       return res.status(response.status).json({
         error: { message: data.error?.message || 'AI service error. Try again.' }
       });
