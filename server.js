@@ -214,8 +214,10 @@ async function trialDailyLimiter(req, res, next) {
     if (count > TRIAL_DAILY_CAP) {
       attachTrialHeaders(req, res);
       return res.status(429).json({
-        error: 'daily_limit',
-        message: `You've reached today's limit of ${TRIAL_DAILY_CAP} diagnoses. Try again tomorrow.`,
+        error: {
+          message: `You've reached today's limit of ${TRIAL_DAILY_CAP} diagnoses. Try again tomorrow.`,
+          type: 'daily_limit'
+        },
         limit: TRIAL_DAILY_CAP,
         resetAt: nextResetUTC()
       });
@@ -238,8 +240,10 @@ async function globalDailyBreaker(req, res, next) {
         console.error(`🚨 GLOBAL DAILY CAP still active: ${count} requests blocked/attempted today.`);
       }
       return res.status(503).json({
-        error: 'service_busy',
-        message: 'FixIt AI is very busy right now. Please try again later.'
+        error: {
+          message: 'FixIt AI is very busy right now. Please try again later.',
+          type: 'service_busy'
+        }
       });
     }
     next();

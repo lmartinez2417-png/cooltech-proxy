@@ -170,7 +170,8 @@ describe('trial daily cap', () => {
     expect((await ask(app, 'hank')).status).toBe(200);
     const res = await ask(app, 'hank');
     expect(res.status).toBe(429);
-    expect(res.body.error).toBe('daily_limit');
+    expect(res.body.error.type).toBe('daily_limit');
+    expect(res.body.error.message).toMatch(/today's limit of 2/);
     expect(res.body.limit).toBe(2);
     expect(new Date(res.body.resetAt).toISOString()).toBe(res.body.resetAt);
     expect(new Date(res.body.resetAt).getTime()).toBeGreaterThan(Date.now());
@@ -188,7 +189,7 @@ describe('trial daily cap', () => {
     expect((await ask(withRedis({ TRIAL_DAILY_CAP: '1' }), 'kate')).status).toBe(200);
     const res = await ask(withRedis({ TRIAL_DAILY_CAP: '1' }), 'kate');
     expect(res.status).toBe(429);
-    expect(res.body.error).toBe('daily_limit');
+    expect(res.body.error.type).toBe('daily_limit');
   });
 
   test('defaults to 10 per day', async () => {
@@ -207,7 +208,10 @@ describe('global daily circuit breaker', () => {
     expect((await ask(app, 'u2')).status).toBe(200);
     const res = await ask(app, 'u3');
     expect(res.status).toBe(503);
-    expect(res.body.error).toBe('service_busy');
+    expect(res.body.error).toEqual({
+      message: 'FixIt AI is very busy right now. Please try again later.',
+      type: 'service_busy'
+    });
     expect(global.fetch).toHaveBeenCalledTimes(2);
     const errors = console.error.mock.calls.map((c) => c.join(' ')).join('\n');
     expect(errors).toMatch(/GLOBAL DAILY CAP HIT/);
