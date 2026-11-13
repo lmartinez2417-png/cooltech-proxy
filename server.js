@@ -20,8 +20,12 @@
  *   STRIPE_PAYMENT_LINK — Optional. Your Stripe payment URL for upgrades.
  *   REDIS_URL           — Optional. Redis connection URL for persistent rate limiting.
  *                          If not set, falls back to in-memory (resets on deploy/restart).
- *   FIREBASE_PROJECT_ID — Optional. Your Firebase project ID for token verification.
- *                          If not set, auth tokens are not verified (open access).
+ *   FIREBASE_PROJECT_ID — Required. Your Firebase project ID for token verification.
+ *   TRIAL_DAYS          — Optional. Length of the free trial in days (default: 7)
+ *   FREE_MONTHLY        — Optional. Free diagnoses per 30 days after the trial (default: 3)
+ *   TRIAL_DAILY_CAP     — Optional. Max requests per user per UTC day during the trial (default: 10)
+ *   GLOBAL_DAILY_CAP    — Optional. Max requests across ALL users per UTC day — a circuit
+ *                          breaker that protects the Anthropic bill (default: 2000)
  */
 
 const express = require('express');
@@ -29,6 +33,7 @@ const rateLimit = require('express-rate-limit');
 const cors = require('cors');
 const helmet = require('helmet');
 const admin = require('firebase-admin');
+const { KEY_PREFIX, todayUTC, nextResetUTC, createUsageStore, LongWindowMemoryStore } = require('./usage');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -117,35 +122,55 @@ async function verifyAuth(req, res, next) {
 // REDIS (persistent rate limiting)
 // ═══════════════════════════════════════
 
-let redisStore = null;
+let redisClient = null;
 if (process.env.REDIS_URL) {
   try {
     const Redis = require('ioredis');
-    const { RedisStore } = require('rate-limit-redis');
-    const redisClient = new Redis(process.env.REDIS_URL, {
+    redisClient = new Redis(process.env.REDIS_URL, {
       maxRetriesPerRequest: 3,
       retryStrategy: (times) => Math.min(times * 200, 2000),
       enableOfflineQueue: true
     });
     redisClient.on('connect', () => console.log('Redis connected — persistent rate limiting active'));
     redisClient.on('error', (err) => console.error('Redis error:', err.message));
-    redisStore = new RedisStore({ sendCommand: (...args) => redisClient.call(...args) });
   } catch (err) {
+    redisClient = null;
     console.warn('Redis setup failed, using in-memory rate limiting:', err.message);
   }
-} else {
-  console.log('No REDIS_URL set — using in-memory rate limiting (resets on restart)');
 }
+if (!redisClient) {
+  console.warn('⚠️  WARNING: No working REDIS_URL — trial dates and all usage counters are IN MEMORY.');
+  console.warn('⚠️  Every deploy/restart gives every user a fresh trial and resets all limits.');
+  console.warn('⚠️  Add Redis on Railway before launch (see DEPLOY.md).');
+}
+
+// Each rate limiter gets its OWN Redis store with its OWN key prefix.
+// (Sharing one store made the burst and monthly limiters overwrite each other's counts.)
+function makeRedisStore(prefix) {
+  if (!redisClient) return null;
+  const { RedisStore } = require('rate-limit-redis');
+  return new RedisStore({ prefix, sendCommand: (...args) => redisClient.call(...args) });
+}
+const burstStore = makeRedisStore(KEY_PREFIX.burst);
+// Without Redis, the monthly limiter needs a memory store that supports a 30-day window.
+const monthlyStore = makeRedisStore(KEY_PREFIX.monthly) || new LongWindowMemoryStore();
+
+// Trial start dates + daily counters (Redis if available, else memory)
+const usageStore = createUsageStore(redisClient);
 
 // ═══════════════════════════════════════
 // RATE LIMITING — TRIAL-AWARE
 // ═══════════════════════════════════════
-// Model: 7-day full trial (unlimited) → then N free diagnoses / 30-day rolling
-// window. "First seen" timestamp per UID is tracked in-memory (acceptable for
-// v1 — a proxy restart grants an extra trial; real users won't farm it).
+// Model: 7-day trial (up to TRIAL_DAILY_CAP a day) → then N free diagnoses /
+// 30-day rolling window. On top of that, GLOBAL_DAILY_CAP stops ALL AI calls
+// for the rest of the UTC day if total traffic spikes (protects the bill).
+// The trial start per UID is stored in Redis, so restarts don't reset it.
 
+const DAY_MS = 24 * 60 * 60 * 1000;
 const TRIAL_DAYS = parseInt(process.env.TRIAL_DAYS) || 7;
 const FREE_MONTHLY = parseInt(process.env.FREE_MONTHLY) || 3;
+const TRIAL_DAILY_CAP = parseInt(process.env.TRIAL_DAILY_CAP) || 10;
+const GLOBAL_DAILY_CAP = parseInt(process.env.GLOBAL_DAILY_CAP) || 2000;
 
 // Legacy env alias — keep so existing Railway var doesn't blow up
 const FREE_LIMIT = FREE_MONTHLY;
@@ -153,31 +178,74 @@ const FREE_LIMIT = FREE_MONTHLY;
 // Use Firebase UID if authenticated (fair per-user limiting), fall back to IP
 const userKey = (req) => req.uid || req.ip;
 
-// Track first-seen timestamp per UID to anchor the trial window.
-// In-memory — resets on deploy. TODO: persist to Redis when we expose the client.
-const firstSeen = new Map();
-function getTrialStart(uid) {
-  if (!uid) return null;
-  if (!firstSeen.has(uid)) firstSeen.set(uid, Date.now());
-  return firstSeen.get(uid);
-}
-function msSinceTrialStart(uid) {
-  const start = getTrialStart(uid);
-  return start ? Date.now() - start : 0;
-}
-function isInTrial(uid) {
-  return msSinceTrialStart(uid) < TRIAL_DAYS * 24 * 60 * 60 * 1000;
-}
-function trialDaysLeft(uid) {
-  const ms = TRIAL_DAYS * 24 * 60 * 60 * 1000 - msSinceTrialStart(uid);
-  return Math.max(0, Math.ceil(ms / (24 * 60 * 60 * 1000)));
+// Middleware: look up (or record) when this user's trial started.
+// Sets req.inTrial and req.trialDaysLeft for the limiters and headers below.
+async function loadTrial(req, res, next) {
+  try {
+    req.inTrial = false;
+    req.trialDaysLeft = 0;
+    if (req.uid) {
+      const start = await usageStore.getTrialStart(req.uid);
+      const msLeft = TRIAL_DAYS * DAY_MS - (Date.now() - start);
+      req.inTrial = msLeft > 0;
+      req.trialDaysLeft = Math.max(0, Math.ceil(msLeft / DAY_MS));
+    }
+    next();
+  } catch (err) {
+    next(err);
+  }
 }
 
 // Expose trial+quota status on every /ai response via headers.
 function attachTrialHeaders(req, res) {
   if (!req.uid) return;
-  res.setHeader('X-Trial-Days-Left', String(trialDaysLeft(req.uid)));
-  res.setHeader('X-Trial-Active', isInTrial(req.uid) ? '1' : '0');
+  res.setHeader('X-Trial-Days-Left', String(req.trialDaysLeft));
+  res.setHeader('X-Trial-Active', req.inTrial ? '1' : '0');
+}
+
+// Middleware: hard daily cap for trial users (TRIAL_DAILY_CAP per UTC day).
+async function trialDailyLimiter(req, res, next) {
+  // TODO: Skip for paid/subscribed users once payments exist (e.g. a Firebase
+  // custom claim like decoded.paid). Today nobody can pay, so everyone is free.
+  if (!req.inTrial) return next();
+  try {
+    const key = `${KEY_PREFIX.trialDaily}${todayUTC()}:${req.uid}`;
+    const count = await usageStore.incrementDaily(key);
+    if (count > TRIAL_DAILY_CAP) {
+      attachTrialHeaders(req, res);
+      return res.status(429).json({
+        error: 'daily_limit',
+        message: `You've reached today's limit of ${TRIAL_DAILY_CAP} diagnoses. Try again tomorrow.`,
+        limit: TRIAL_DAILY_CAP,
+        resetAt: nextResetUTC()
+      });
+    }
+    next();
+  } catch (err) {
+    next(err);
+  }
+}
+
+// Middleware: global circuit breaker — total AI calls across ALL users per UTC day.
+async function globalDailyBreaker(req, res, next) {
+  try {
+    const count = await usageStore.incrementDaily(`${KEY_PREFIX.globalDaily}${todayUTC()}`);
+    if (count > GLOBAL_DAILY_CAP) {
+      if (count === GLOBAL_DAILY_CAP + 1) {
+        console.error(`🚨 GLOBAL DAILY CAP HIT: ${GLOBAL_DAILY_CAP} AI requests today. ` +
+          `All AI calls are paused until ${nextResetUTC()}. Check for abuse, or raise GLOBAL_DAILY_CAP.`);
+      } else if (count % 100 === 0) {
+        console.error(`🚨 GLOBAL DAILY CAP still active: ${count} requests blocked/attempted today.`);
+      }
+      return res.status(503).json({
+        error: 'service_busy',
+        message: 'FixIt AI is very busy right now. Please try again later.'
+      });
+    }
+    next();
+  } catch (err) {
+    next(err);
+  }
 }
 
 const freeLimiter = rateLimit({
@@ -185,7 +253,7 @@ const freeLimiter = rateLimit({
   max: FREE_MONTHLY,                      // N free looks after trial ends
   standardHeaders: true,                  // Return rate limit info in headers
   legacyHeaders: false,
-  ...(redisStore && { store: redisStore }),
+  store: monthlyStore,
   keyGenerator: userKey,
   handler: (req, res) => {
     attachTrialHeaders(req, res);
@@ -200,7 +268,7 @@ const freeLimiter = rateLimit({
   skip: (req) => {
     // Skip the monthly limiter entirely for users still inside their trial.
     // TODO: Also skip for paid/subscribed users (check Firebase custom claim).
-    if (req.uid && isInTrial(req.uid)) return true;
+    if (req.uid && req.inTrial) return true;
     return false;
   }
 });
@@ -211,7 +279,7 @@ const burstLimiter = rateLimit({
   max: 3,                 // 3 per minute
   standardHeaders: true,
   legacyHeaders: false,
-  ...(redisStore && { store: redisStore }),
+  ...(burstStore && { store: burstStore }),
   keyGenerator: userKey,
   handler: (req, res) => {
     res.status(429).json({
@@ -294,7 +362,9 @@ app.get('/upgrade', (req, res) => {
 });
 
 // Main AI endpoint — auth verified, rate limited
-app.post('/ai', verifyAuth, burstLimiter, freeLimiter, async (req, res) => {
+// Order matters: per-user limits run first, so blocked users never count
+// toward the global cap.
+app.post('/ai', verifyAuth, burstLimiter, loadTrial, trialDailyLimiter, freeLimiter, globalDailyBreaker, async (req, res) => {
   // Validate API key is configured
   const apiKey = process.env.ANTHROPIC_API_KEY;
   if (!apiKey) {
@@ -345,7 +415,7 @@ app.post('/ai', verifyAuth, burstLimiter, freeLimiter, async (req, res) => {
     console.log('DIAG', JSON.stringify({
       ts: new Date().toISOString(),
       uid: uidHash,
-      trial: isInTrial(req.uid) ? 1 : 0,
+      trial: req.inTrial ? 1 : 0,
       in: data.usage?.input_tokens,
       out: data.usage?.output_tokens
     }));
@@ -385,16 +455,25 @@ app.use((err, req, res, next) => {
 // START
 // ═══════════════════════════════════════
 
-app.listen(PORT, () => {
-  console.log(`FixIt AI Proxy running on port ${PORT}`);
-  console.log(`Rate limit: ${FREE_LIMIT} requests/day per IP`);
-  console.log(`Burst limit: 3 requests/minute per IP`);
-  console.log(`Storage: ${redisStore ? 'Redis (persistent)' : 'In-memory (resets on restart)'}`);
-  console.log(`Auth: ${firebaseEnabled ? 'Firebase (required)' : 'Disabled (open access)'}`);
-  if (!process.env.ANTHROPIC_API_KEY) {
-    console.warn('⚠️  WARNING: ANTHROPIC_API_KEY not set! AI calls will fail.');
-  }
-  if (process.env.STRIPE_PAYMENT_LINK) {
-    console.log(`Upgrade URL: ${process.env.STRIPE_PAYMENT_LINK}`);
-  }
-});
+function start() {
+  return app.listen(PORT, () => {
+    console.log(`FixIt AI Proxy running on port ${PORT}`);
+    console.log(`Trial: ${TRIAL_DAYS} days, max ${TRIAL_DAILY_CAP} requests/day per user`);
+    console.log(`After trial: ${FREE_LIMIT} free requests per 30 days per user`);
+    console.log(`Burst limit: 3 requests/minute per user`);
+    console.log(`Global cap: ${GLOBAL_DAILY_CAP} requests/day across all users`);
+    console.log(`Storage: ${redisClient ? 'Redis (persistent)' : 'In-memory (resets on restart)'}`);
+    console.log(`Auth: ${firebaseEnabled ? 'Firebase (required)' : 'Disabled (open access)'}`);
+    if (!process.env.ANTHROPIC_API_KEY) {
+      console.warn('⚠️  WARNING: ANTHROPIC_API_KEY not set! AI calls will fail.');
+    }
+    if (process.env.STRIPE_PAYMENT_LINK) {
+      console.log(`Upgrade URL: ${process.env.STRIPE_PAYMENT_LINK}`);
+    }
+  });
+}
+
+// Start the server when run directly (`npm start`); tests import the app instead.
+if (require.main === module) start();
+
+module.exports = { app, start };
