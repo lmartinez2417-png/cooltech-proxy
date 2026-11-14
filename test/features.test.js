@@ -421,3 +421,14 @@ describe('account deletion covers the new data', () => {
     expect(await redis.keys(`fixit:ask:${org.id}`)).toEqual([]);
   });
 });
+
+describe('CORS', () => {
+  test('preflight allows PUT (company price list) from an allowed origin', async () => {
+    const app = withRedis({ ALLOWED_ORIGINS: 'https://app.example' });
+    const res = await request(app).options('/org/pricelist')
+      .set('Origin', 'https://app.example')
+      .set('Access-Control-Request-Method', 'PUT');
+    expect(res.headers['access-control-allow-origin']).toBe('https://app.example');
+    expect(res.headers['access-control-allow-methods']).toMatch(/PUT/);
+  });
+});
