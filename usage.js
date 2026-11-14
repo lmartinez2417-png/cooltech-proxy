@@ -10,6 +10,8 @@
  *   fixit:global:daily:<YYYY-MM-DD>       — requests across ALL users that UTC day
  *   fixit:team:daily:<YYYY-MM-DD>:<uid>   — requests by a team (org) member that UTC day
  *   fixit:plate:daily:<YYYY-MM-DD>:<uid>  — data plate scans by a user that UTC day
+ *   fixit:fault:daily:… / fixit:gauge:daily:… / fixit:closeout:daily:… / fixit:ask:daily:…
+ *                                         — fault lookups, gauge reads, close-outs, lead asks per user per UTC day
  * (The express-rate-limit stores in server.js use fixit:rl:burst: and fixit:rl:monthly:)
  */
 
@@ -19,6 +21,10 @@ const KEY_PREFIX = {
   globalDaily: 'fixit:global:daily:',
   teamDaily: 'fixit:team:daily:',
   plateDaily: 'fixit:plate:daily:',
+  faultDaily: 'fixit:fault:daily:',
+  gaugeDaily: 'fixit:gauge:daily:',
+  closeoutDaily: 'fixit:closeout:daily:',
+  askDaily: 'fixit:ask:daily:',
   burst: 'fixit:rl:burst:',
   monthly: 'fixit:rl:monthly:'
 };

@@ -35,6 +35,10 @@
  *                          immediately (default: inactive until you activate them)
  *   PLATFORM_ADMIN_EMAILS — Optional. Comma-separated verified emails allowed to use /admin/orgs
  *   ANTHROPIC_MODEL     — Optional. Model id (default: claude-sonnet-4-20250514)
+ *   FAULT_DAILY_CAP     — Optional. Max fault-code lookups per user per UTC day (default: 30)
+ *   GAUGE_DAILY_CAP     — Optional. Max gauge/meter photo reads per user per UTC day (default: 40)
+ *   CLOSEOUT_DAILY_CAP  — Optional. Max close-out write-ups per user per UTC day (default: 30)
+ *   ASK_DAILY_CAP       — Optional. Max "Ask a lead tech" requests per user per UTC day (default: 20)
  */
 
 const express = require('express');
@@ -43,8 +47,14 @@ const cors = require('cors');
 const helmet = require('helmet');
 const admin = require('firebase-admin');
 const { KEY_PREFIX, todayUTC, nextResetUTC, createUsageStore, LongWindowMemoryStore } = require('./usage');
-const { buildAiRequest, buildDataPlateRequest, parsePlate, BadRequest } = require('./prompts');
+const {
+  buildAiRequest, buildDataPlateRequest, parsePlate, BadRequest,
+  buildFaultRequest, buildGaugeRequest, parseGauge, buildCloseoutRequest, historyBlock, withHistory, clean
+} = require('./prompts');
 const { createOrgStore, OrgError } = require('./orgs');
+const { createEquipmentStore, EqError } = require('./equipment');
+const { createAskStore, AskError, isLead } = require('./asks');
+const { literatureLinks } = require('./literature');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -190,6 +200,10 @@ const FREE_MONTHLY = parseInt(process.env.FREE_MONTHLY) || 3;
 const TRIAL_DAILY_CAP = parseInt(process.env.TRIAL_DAILY_CAP) || 10;
 const TEAM_DAILY_CAP = parseInt(process.env.TEAM_DAILY_CAP) || 100;
 const PLATE_DAILY_CAP = parseInt(process.env.PLATE_DAILY_CAP) || 30;
+const FAULT_DAILY_CAP = parseInt(process.env.FAULT_DAILY_CAP) || 30;
+const GAUGE_DAILY_CAP = parseInt(process.env.GAUGE_DAILY_CAP) || 40;
+const CLOSEOUT_DAILY_CAP = parseInt(process.env.CLOSEOUT_DAILY_CAP) || 30;
+const ASK_DAILY_CAP = parseInt(process.env.ASK_DAILY_CAP) || 20;
 const GLOBAL_DAILY_CAP = parseInt(process.env.GLOBAL_DAILY_CAP) || 2000;
 const MODEL = process.env.ANTHROPIC_MODEL || 'claude-sonnet-4-20250514';
 const PLATFORM_ADMIN_EMAILS = (process.env.PLATFORM_ADMIN_EMAILS || '')
@@ -205,6 +219,9 @@ const orgStore = createOrgStore(redisClient, {
   // so nobody can create a company just to skip the free limits.
   selfServeActive: process.env.ORG_SELF_SERVE_ACTIVE === 'true'
 });
+// Equipment history (customers/addresses, units, jobs) and the lead-tech queue — same Redis
+const equipmentStore = createEquipmentStore(redisClient);
+const askStore = createAskStore(redisClient);
 let bootstrapDone = null;
 function ensureBootstrap() {
   if (!bootstrapDone) {
@@ -404,21 +421,27 @@ const burstLimiter = rateLimit({
   }
 });
 
-// Data plate scans: light, separate per-user daily cap (doesn't use trial/monthly allowance).
-async function plateDailyLimiter(req, res, next) {
-  try {
-    const count = await usageStore.incrementDaily(`${KEY_PREFIX.plateDaily}${todayUTC()}:${req.uid}`);
-    if (count > PLATE_DAILY_CAP) {
-      return limitResponse(req, res, 429, {
-        message: `You've reached today's limit of ${PLATE_DAILY_CAP} data plate scans.`,
-        type: 'plate_daily_limit'
-      }, { limit: PLATE_DAILY_CAP, resetAt: nextResetUTC() });
+// Light, separate per-user daily caps for the helper tools (don't use the trial/monthly
+// diagnosis allowance): data plate scans, fault-code lookups, gauge reads, close-outs, lead asks.
+function dailyCap(prefix, cap, type, what) {
+  return async (req, res, next) => {
+    try {
+      const count = await usageStore.incrementDaily(`${prefix}${todayUTC()}:${req.uid}`);
+      if (count > cap) {
+        return limitResponse(req, res, 429, { message: `You've reached today's limit of ${cap} ${what}.`, type },
+          { limit: cap, resetAt: nextResetUTC() });
+      }
+      next();
+    } catch (err) {
+      next(err);
     }
-    next();
-  } catch (err) {
-    next(err);
-  }
+  };
 }
+const plateDailyLimiter = dailyCap(KEY_PREFIX.plateDaily, PLATE_DAILY_CAP, 'plate_daily_limit', 'data plate scans');
+const faultDailyLimiter = dailyCap(KEY_PREFIX.faultDaily, FAULT_DAILY_CAP, 'fault_daily_limit', 'fault code lookups');
+const gaugeDailyLimiter = dailyCap(KEY_PREFIX.gaugeDaily, GAUGE_DAILY_CAP, 'gauge_daily_limit', 'gauge photo reads');
+const closeoutDailyLimiter = dailyCap(KEY_PREFIX.closeoutDaily, CLOSEOUT_DAILY_CAP, 'closeout_daily_limit', 'close-outs');
+const askDailyLimiter = dailyCap(KEY_PREFIX.askDaily, ASK_DAILY_CAP, 'ask_daily_limit', 'lead tech requests');
 
 // ═══════════════════════════════════════
 // INPUT VALIDATION (prompts are built server-side — see prompts.js)
@@ -489,6 +512,73 @@ function requirePlatformAdmin(req, res, next) {
   next();
 }
 
+// Equipment history scope: the company (shared by all its techs) or the solo user.
+const eqScope = (req) => (req.org ? `org:${req.org.id}` : `user:${req.uid}`);
+const eqAdmin = (req) => !req.org || req.orgRole === 'admin';
+
+// If the app sends siteId (and optionally unitIds), add that customer's equipment
+// and recent jobs to the diagnosis as data. Unknown ids are ignored, never an error.
+async function attachHistory(req, res, next) {
+  try {
+    const siteId = req.body && req.body.siteId;
+    if (!siteId) return next();
+    const full = await equipmentStore.getSiteFull(eqScope(req), String(siteId), 5);
+    if (!full) return next();
+    const ids = Array.isArray(req.body.unitIds) ? req.body.unitIds : null;
+    const units = ids && ids.length ? full.units.filter((u) => ids.includes(u.id)) : full.units;
+    const jobs = ids && ids.length ? full.jobs.filter((j) => !j.unitIds.length || j.unitIds.some((u) => ids.includes(u))) : full.jobs;
+    req.aiRequest = withHistory(req.aiRequest, historyBlock(full.site, units.length ? units : full.units, jobs));
+    req.historyUsed = true;
+    next();
+  } catch (err) {
+    next(err);
+  }
+}
+
+// Shared Anthropic call + error mapping for the tool endpoints. Returns the text or null (response sent).
+async function aiTextOrError(req, res, tag) {
+  let result;
+  try {
+    result = await callAnthropic(req.aiRequest);
+  } catch (err) {
+    res.status(502).json({ error: { message: 'Could not reach AI service. Try again in a moment.', type: 'upstream_unreachable' } });
+    return null;
+  }
+  const { response, data } = result;
+  if (!response.ok) {
+    console.error(`Anthropic API error (${tag}):`, { status: response.status, type: data?.error?.type });
+    res.status(502).json({ error: { message: 'AI service error. Try again.', type: 'upstream_error' } });
+    return null;
+  }
+  console.log(tag.toUpperCase(), JSON.stringify({ ts: new Date().toISOString(), uid: String(req.uid).slice(0, 8), org: req.org ? req.org.id : null, in: data.usage?.input_tokens, out: data.usage?.output_tokens }));
+  return { text: (data.content || []).map((c) => c.text || '').join('').trim(), data };
+}
+
+const typedRoute = (Err) => (fn) => wrap(async (req, res) => {
+  try {
+    await fn(req, res);
+  } catch (err) {
+    if (err instanceof Err || err instanceof OrgError) return res.status(err.status).json({ error: { message: err.message, type: err.type } });
+    throw err;
+  }
+});
+const eqRoute = typedRoute(EqError);
+const askRoute = typedRoute(AskError);
+
+function requireOrg(req, res, next) {
+  if (!req.org) return res.status(404).json({ error: { message: 'You are not in a company.', type: 'no_org' } });
+  next();
+}
+function requireOrgLead(req, res, next) {
+  if (!req.org) return res.status(404).json({ error: { message: 'You are not in a company.', type: 'no_org' } });
+  if (!isLead(req.orgRole)) return res.status(403).json({ error: { message: 'Only lead techs and admins can do that.', type: 'forbidden' } });
+  next();
+}
+async function memberName(req) {
+  const m = req.org ? await orgStore.getMember(req.org.id, req.uid) : null;
+  return (m && m.name) || req.displayName || req.email || null;
+}
+
 // ═══════════════════════════════════════
 // ROUTES
 // ═══════════════════════════════════════
@@ -514,7 +604,7 @@ app.get('/upgrade', (req, res) => {
 
 // Main AI endpoint — auth verified, input validated (so bad requests never use
 // up quota), then per-user limits, then the global cap.
-app.post('/ai', verifyAuth, burstLimiter, validateWith(buildAiRequest), loadAccount,
+app.post('/ai', verifyAuth, burstLimiter, validateWith(buildAiRequest), loadAccount, attachHistory,
   teamDailyLimiter, trialDailyLimiter, freeLimiter, globalDailyBreaker, requireApiKey, wrap(async (req, res) => {
     let result;
     try {
@@ -549,6 +639,7 @@ app.post('/ai', verifyAuth, burstLimiter, validateWith(buildAiRequest), loadAcco
     attachTrialHeaders(req, res);
     res.json({
       content: data.content,
+      historyUsed: !!req.historyUsed,
       usage: {
         input_tokens: data.usage?.input_tokens,
         output_tokens: data.usage?.output_tokens
@@ -580,6 +671,118 @@ app.post('/dataplate', verifyAuth, burstLimiter, validateWith(buildDataPlateRequ
     res.json({ plate });
   }));
 
+// Fault / error code lookup → result cards + manufacturer literature searches.
+// Own daily cap (doesn't use the diagnosis allowance) + global cap.
+app.post('/fault', verifyAuth, burstLimiter, validateWith(buildFaultRequest), loadAccount,
+  faultDailyLimiter, globalDailyBreaker, requireApiKey, wrap(async (req, res) => {
+    const out = await aiTextOrError(req, res, 'fault');
+    if (!out) return;
+    if (!out.text) return res.status(502).json({ error: { message: 'AI service error. Try again.', type: 'upstream_error' } });
+    res.json({ content: [{ type: 'text', text: out.text }], lookup: req.aiRequest.lookup, links: literatureLinks(req.aiRequest.lookup) });
+  }));
+
+// Gauge / meter photo → readings (psig, °F, V, A) the tech must confirm before use.
+app.post('/gauge', verifyAuth, burstLimiter, validateWith(buildGaugeRequest), loadAccount,
+  gaugeDailyLimiter, globalDailyBreaker, requireApiKey, wrap(async (req, res) => {
+    const out = await aiTextOrError(req, res, 'gauge');
+    if (!out) return;
+    const gauge = parseGauge(out.text);
+    if (!gauge) {
+      return res.status(422).json({ error: { message: "Couldn't read the gauges in that photo. Try straight-on, closer, with less glare — or type the values.", type: 'gauge_unreadable' } });
+    }
+    res.json({ gauge });
+  }));
+
+// Close-out: parts, repair vs replace, additional work, customer summary.
+// Company members use the company's price list (server-side); solo techs may send their own.
+app.post('/closeout', verifyAuth, burstLimiter, loadAccount, wrap(async (req, res, next) => {
+  try {
+    const priceList = req.org ? await orgStore.getPriceList(req.org.id) : undefined;
+    req.aiRequest = buildCloseoutRequest(req.body, { priceList });
+    next();
+  } catch (err) {
+    if (err instanceof BadRequest) return res.status(400).json({ error: { message: err.message, type: err.type } });
+    throw err;
+  }
+}), closeoutDailyLimiter, globalDailyBreaker, requireApiKey, wrap(async (req, res) => {
+  const out = await aiTextOrError(req, res, 'closeout');
+  if (!out) return;
+  if (!out.text) return res.status(502).json({ error: { message: 'AI service error. Try again.', type: 'upstream_error' } });
+  res.json({ content: [{ type: 'text', text: out.text }], priceListUsed: req.aiRequest.hasPriceList });
+}));
+
+// ── Equipment history (customers / addresses, units, jobs) ──
+app.get('/sites', verifyAuth, loadAccount, eqRoute(async (req, res) => {
+  res.json(await equipmentStore.search(eqScope(req), clean(req.query.q, 100), Math.min(50, parseInt(req.query.limit, 10) || 20)));
+}));
+app.post('/sites', verifyAuth, loadAccount, eqRoute(async (req, res) => {
+  res.status(201).json({ site: await equipmentStore.createSite(eqScope(req), req.body, { uid: req.uid }) });
+}));
+app.get('/sites/:id', verifyAuth, loadAccount, eqRoute(async (req, res) => {
+  const full = await equipmentStore.getSiteFull(eqScope(req), req.params.id);
+  if (!full) return res.status(404).json({ error: { message: 'Customer not found', type: 'not_found' } });
+  res.json(full);
+}));
+app.patch('/sites/:id', verifyAuth, loadAccount, eqRoute(async (req, res) => {
+  res.json({ site: await equipmentStore.updateSite(eqScope(req), req.params.id, req.body) });
+}));
+app.delete('/sites/:id', verifyAuth, loadAccount, eqRoute(async (req, res) => {
+  if (!eqAdmin(req)) return res.status(403).json({ error: { message: 'Only company admins can delete a customer.', type: 'forbidden' } });
+  await equipmentStore.deleteSite(eqScope(req), req.params.id);
+  res.json({ deleted: true });
+}));
+app.post('/sites/:id/units', verifyAuth, loadAccount, eqRoute(async (req, res) => {
+  res.json({ unit: await equipmentStore.upsertUnit(eqScope(req), req.params.id, req.body) });
+}));
+app.delete('/sites/:id/units/:unitId', verifyAuth, loadAccount, eqRoute(async (req, res) => {
+  if (!eqAdmin(req)) return res.status(403).json({ error: { message: 'Only company admins can remove a unit.', type: 'forbidden' } });
+  await equipmentStore.deleteUnit(eqScope(req), req.params.id, req.params.unitId);
+  res.json({ deleted: true });
+}));
+app.post('/sites/:id/jobs', verifyAuth, loadAccount, eqRoute(async (req, res) => {
+  const body = { ...(req.body || {}), techName: (req.body && req.body.techName) || await memberName(req) };
+  res.status(201).json({ job: await equipmentStore.addJob(eqScope(req), req.params.id, body, { uid: req.uid }) });
+}));
+app.delete('/sites/:id/jobs/:jobId', verifyAuth, loadAccount, eqRoute(async (req, res) => {
+  await equipmentStore.deleteJob(eqScope(req), req.params.id, req.params.jobId, { uid: req.uid, isAdmin: eqAdmin(req) });
+  res.json({ deleted: true });
+}));
+
+// ── Ask a lead tech (company members; leads/admins answer from a queue) ──
+app.post('/ask', verifyAuth, loadAccount, requireOrg, askDailyLimiter, askRoute(async (req, res) => {
+  const ask = await askStore.create(req.org, { uid: req.uid, name: await memberName(req), email: req.email }, req.body);
+  res.status(201).json({ ask });
+}));
+app.get('/ask/mine', verifyAuth, loadAccount, requireOrg, askRoute(async (req, res) => {
+  res.json({ asks: await askStore.mine(req.org.id, req.uid) });
+}));
+app.get('/ask/queue', verifyAuth, loadAccount, requireOrgLead, askRoute(async (req, res) => {
+  res.json(await askStore.queue(req.org.id));
+}));
+app.get('/ask/:id', verifyAuth, loadAccount, requireOrg, askRoute(async (req, res) => {
+  res.json({ ask: await askStore.read(req.org.id, req.params.id, req.uid, req.orgRole) });
+}));
+app.post('/ask/:id/reply', verifyAuth, loadAccount, requireOrg, askRoute(async (req, res) => {
+  const ask = await askStore.reply(req.org.id, req.params.id, { uid: req.uid, name: await memberName(req), email: req.email }, req.orgRole, req.body);
+  res.json({ ask });
+}));
+app.post('/ask/:id/close', verifyAuth, loadAccount, requireOrg, askRoute(async (req, res) => {
+  res.json({ ask: await askStore.close(req.org.id, req.params.id, req.uid, req.orgRole) });
+}));
+
+// Company price list for close-outs (any member reads; admin edits). Optional.
+app.get('/org/pricelist', verifyAuth, loadAccount, requireOrg, wrap(async (req, res) => {
+  res.json({ text: await orgStore.getPriceList(req.org.id) });
+}));
+app.put('/org/pricelist', verifyAuth, loadAccount, requireOrgAdmin, wrap(async (req, res) => {
+  const text = (req.body || {}).text;
+  if (text != null && typeof text !== 'string') return res.status(400).json({ error: { message: 'text must be a string', type: 'bad_request' } });
+  if (String(text || '').length > 4000) return res.status(400).json({ error: { message: 'Price list too long (max 4000 characters)', type: 'bad_request' } });
+  const v = clean(text, 4000);
+  await orgStore.setPriceList(req.org.id, v);
+  res.json({ text: v });
+}));
+
 // Who am I: plan, remaining quota, company + role.
 app.get('/me', verifyAuth, loadAccount, wrap(async (req, res) => {
   res.json(await accountSummary(req));
@@ -588,8 +791,20 @@ app.get('/me', verifyAuth, loadAccount, wrap(async (req, res) => {
 // Delete server-side data for this account (called by in-app account deletion).
 app.delete('/me', verifyAuth, wrap(async (req, res) => {
   await ensureBootstrap();
+  // Equipment history + lead asks: solo data is deleted; in a company, the company keeps
+  // its customer records but this person's name/uid is removed and their asks are deleted.
+  const { org } = await orgStore.resolveUser({ uid: req.uid });
+  await equipmentStore.deleteScope(`user:${req.uid}`);
+  if (org) {
+    await equipmentStore.anonymizeUser(`org:${org.id}`, req.uid);
+    await askStore.deleteUser(org.id, req.uid);
+  }
   try {
-    await orgStore.leave({ uid: req.uid }, { promote: true });
+    const left = await orgStore.leave({ uid: req.uid }, { promote: true });
+    if (left && left.orgDeleted) {
+      await equipmentStore.deleteScope(`org:${left.orgId}`);
+      await askStore.deleteOrg(left.orgId);
+    }
   } catch (err) {
     if (!(err instanceof OrgError)) throw err;
   }
@@ -597,7 +812,8 @@ app.delete('/me', verifyAuth, wrap(async (req, res) => {
   const yesterday = todayUTC(Date.now() - DAY_MS);
   const keys = [`${KEY_PREFIX.trialStart}${req.uid}`];
   for (const d of [today, yesterday]) {
-    keys.push(`${KEY_PREFIX.trialDaily}${d}:${req.uid}`, `${KEY_PREFIX.teamDaily}${d}:${req.uid}`, `${KEY_PREFIX.plateDaily}${d}:${req.uid}`);
+    keys.push(`${KEY_PREFIX.trialDaily}${d}:${req.uid}`, `${KEY_PREFIX.teamDaily}${d}:${req.uid}`, `${KEY_PREFIX.plateDaily}${d}:${req.uid}`,
+      `${KEY_PREFIX.faultDaily}${d}:${req.uid}`, `${KEY_PREFIX.gaugeDaily}${d}:${req.uid}`, `${KEY_PREFIX.closeoutDaily}${d}:${req.uid}`, `${KEY_PREFIX.askDaily}${d}:${req.uid}`);
   }
   await usageStore.deleteKeys(keys);
   await monthlyStore.resetKey(req.uid);
@@ -635,7 +851,11 @@ app.post('/org/join', verifyAuth, loadAccount, orgRoute(async (req, res) => {
 
 // Leave the company.
 app.post('/org/leave', verifyAuth, loadAccount, orgRoute(async (req, res) => {
-  await orgStore.leave({ uid: req.uid });
+  const left = await orgStore.leave({ uid: req.uid });
+  if (left && left.orgDeleted) {
+    await equipmentStore.deleteScope(`org:${left.orgId}`);
+    await askStore.deleteOrg(left.orgId);
+  }
   req.org = null; req.orgRole = null; req.isTeam = false;
   req.plan = req.isPaid ? 'paid' : req.inTrial ? 'trial' : 'free';
   res.json(await accountSummary(req));
@@ -677,7 +897,7 @@ app.delete('/org/members/:uid', verifyAuth, loadAccount, requireOrgAdmin, orgRou
 // Change a member's role (admin).
 app.post('/org/members/:uid/role', verifyAuth, loadAccount, requireOrgAdmin, orgRoute(async (req, res) => {
   const role = (req.body || {}).role;
-  if (!['admin', 'tech'].includes(role)) return res.status(400).json({ error: { message: 'role must be admin or tech', type: 'bad_request' } });
+  if (!['admin', 'lead', 'tech'].includes(role)) return res.status(400).json({ error: { message: 'role must be admin, lead or tech', type: 'bad_request' } });
   if (req.params.uid === req.uid && role !== 'admin') {
     const admins = (await orgStore.listMembers(req.org.id)).filter((m) => m.role === 'admin');
     if (admins.length < 2) return res.status(409).json({ error: { message: 'You are the only admin.', type: 'last_admin' } });

@@ -43,6 +43,10 @@ In Railway dashboard → your service → **Variables** tab:
 | `GLOBAL_DAILY_CAP` | `2000` | No (default: 2000) — max diagnoses per day across ALL users |
 | `TEAM_DAILY_CAP` | `100` | No (default: 100) — max AI requests per company member per day |
 | `PLATE_DAILY_CAP` | `30` | No (default: 30) — max data plate scans per user per day |
+| `FAULT_DAILY_CAP` | `30` | No (default: 30) — max fault-code lookups per user per day |
+| `GAUGE_DAILY_CAP` | `40` | No (default: 40) — max gauge/meter photo reads per user per day |
+| `CLOSEOUT_DAILY_CAP` | `30` | No (default: 30) — max close-out write-ups per user per day |
+| `ASK_DAILY_CAP` | `20` | No (default: 20) — max "Ask a lead tech" requests per user per day |
 | `ORG_BOOTSTRAP` | JSON (see Team mode) | No — seeds your first company on startup |
 | `ORG_DEFAULT_SEATS` | `10` | No — seat limit for companies created in the app |
 | `ORG_SELF_SERVE_ACTIVE` | `false` | No — `true` makes app-created companies active immediately |
@@ -145,6 +149,22 @@ Once the new one is working, delete the old Railway service to avoid confusion.
   photos (JPEG/PNG/WebP, ≤~1.5 MB each) and a follow-up history (≤12 alternating turns,
   question ≤500, each earlier message ≤8000 chars). Old-style `system`/`messages` bodies are refused (426).
 - **Data plate scan**: `POST /dataplate` → structured JSON (unknown values are `null`)
+- **Fault code lookup**: `POST /fault` → result cards (MEANING/CONFIDENCE/CAUSE/SAFETY/STEPS/NOTES/VERIFY).
+  The prompt must say "Not sure"/"Unknown" instead of guessing, never invents part/document numbers or URLs,
+  and always points to the unit label / manufacturer literature. `links` are Google searches
+  (manufacturer site + manual search) built on the server — never a specific manual page.
+  No curated fault-code table yet: codes vary by board revision and we haven't sourced one we can stand behind.
+- **Gauge/meter photo**: `POST /gauge` → readings normalized to psig/°F/V/A; converted or doubtful values are `sure:false`.
+  The app makes the tech confirm/edit before anything is used.
+- **Close-out**: `POST /closeout` → PARTS / REPAIR OR REPLACE / ADDITIONAL WORK / CUSTOMER SUMMARY.
+  No invented prices: only items from the company price list (`PUT /org/pricelist`, admin) or, for solo
+  techs, the list the app sends.
+- **Equipment history**: customers/addresses, units and jobs in Redis (`fixit:eq:<scope>:…`), scope =
+  the company (shared by all its techs) or the solo user. `/ai` with `siteId` adds the history as data.
+- **Ask a lead tech**: `fixit:ask:<orgId>`; techs send a call, leads/admins answer from a queue; the app polls.
+- **Account deletion** (`DELETE /me`): solo customers/jobs deleted; in a company the records stay with the
+  company but the person's uid/name is removed from jobs and lead replies, and their own asks are deleted.
+  When the last member leaves, the company's customers and asks are deleted too.
 - **Model lock**: model is set on the server (`ANTHROPIC_MODEL`)
 - **Size limit**: 10MB max request body
 - **Security headers**: Helmet.js adds standard security headers
@@ -164,8 +184,20 @@ ANTHROPIC_API_KEY=sk-ant-... FIREBASE_PROJECT_ID=your-project-id node server.js
 ## API (for the app and future integrations)
 | Method | Path | What |
 |---|---|---|
-| POST | `/ai` | Diagnosis / follow-up. Response: `{content, usage, account}` |
+| POST | `/ai` | Diagnosis / follow-up. Optional `siteId`, `unitIds` add equipment history. Response: `{content, usage, account, historyUsed}` |
 | POST | `/dataplate` | `{photo:{mime,data}}` → `{plate:{brand, model, serial, tonnage, ...}}` |
+| POST | `/fault` | `{code, brand?, model?, equipmentType?, notes?, plate?, lang?}` → `{content, lookup, links[]}` |
+| POST | `/gauge` | `{photo:{mime,data}}` → `{gauge:{readings:{key:{value,unit,sure}}, unsure[], confidence, refrigerant, notes}}` |
+| POST | `/closeout` | `{diagnosis, problem?, plate?, readings?, followUps?, priceList? (solo), lang?}` → `{content, priceListUsed}` |
+| GET/POST | `/sites` | Search `?q=` / create `{name, address, notes?}` |
+| GET/PATCH/DELETE | `/sites/:id` | Customer + units + jobs / edit / delete (company admin) |
+| POST/DELETE | `/sites/:id/units[/:unitId]` | Add/update a unit (matched by serial) / remove (admin) |
+| POST/DELETE | `/sites/:id/jobs[/:jobId]` | Save a job (`reportId` replaces the same report) / delete (author or admin) |
+| POST | `/ask` | Company member: `{question, call:{service, problem, diagnosis, readings, plate, notes, site, photos≤3}}` |
+| GET | `/ask/mine`, `/ask/:id` | Your asks with replies (`unread`) / one ask |
+| GET | `/ask/queue` | Lead/admin: open first, then recent |
+| POST | `/ask/:id/reply`, `/ask/:id/close` | `{text, close?}` |
+| GET/PUT | `/org/pricelist` | Company price list text (admin edits; ≤4000 chars) |
 | GET | `/me` | Plan, remaining quota (`quota.limit/used/remaining/resetAt`), company + role |
 | DELETE | `/me` | Delete server-side data (account deletion) |
 | POST | `/org` | Create company `{name, domain?}` (caller = admin) |
@@ -174,12 +206,13 @@ ANTHROPIC_API_KEY=sk-ant-... FIREBASE_PROJECT_ID=your-project-id node server.js
 | PATCH | `/org/me` | `{name}` — your name for the member list / reports |
 | GET | `/org/members` | Admin: members + usage today / this month |
 | DELETE | `/org/members/:uid` | Admin: remove a tech |
-| POST | `/org/members/:uid/role` | Admin: `{role:"admin"|"tech"}` |
+| POST | `/org/members/:uid/role` | Admin: `{role:"admin"|"lead"|"tech"}` (lead = answers Ask-a-lead, no admin powers) |
 | POST | `/org/invite/rotate` | Admin: new invite code |
 | PATCH | `/org` | Admin: `{name?, logo?}` (logo = PNG/JPEG data URL ≤150 KB, used on PDF reports) |
 | GET/POST | `/admin/orgs`, `/admin/orgs/:id` | Platform admin: list / `{active, seatLimit, plan, domain}` |
 
 Limit errors are `429` with `{error:{message,type}, limit, resetAt}`; types:
-`daily_limit`, `monthly_limit_reached`, `team_daily_limit`, `plate_daily_limit`,
+`daily_limit`, `monthly_limit_reached`, `team_daily_limit`, `plate_daily_limit`, `fault_daily_limit`,
+`gauge_daily_limit`, `closeout_daily_limit`, `ask_daily_limit`,
 `burst_limit_exceeded`, `service_busy`.
 ```

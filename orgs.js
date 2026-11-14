@@ -16,6 +16,7 @@
  *   fixit:org:usage:<orgId>:<YYYY-MM> hash uid -> successful AI requests that month
  *   fixit:user:org:<uid>              orgId
  *   fixit:orgs:index                  hash orgId -> name (platform admin listing)
+ *   fixit:org:pricelist:<orgId>       company price list text (admin-entered; used by close-out)
  *
  * Billing: TODO — `active` and `plan` are set by the platform admin today
  * (scripts/org-admin.js or POST /admin/orgs/:id). When org billing exists, a
@@ -31,45 +32,15 @@ const K = {
   adminEmail: (e) => `fixit:org:admin-email:${e}`,
   usage: (id, ym) => `fixit:org:usage:${id}:${ym}`,
   userOrg: (uid) => `fixit:user:org:${uid}`,
-  index: 'fixit:orgs:index'
+  index: 'fixit:orgs:index',
+  priceList: (id) => `fixit:org:pricelist:${id}`
 };
 
 class OrgError extends Error {
   constructor(status, type, message) { super(message); this.status = status; this.type = type; }
 }
 
-// Minimal KV with the Redis commands we use; memory fallback for dev/tests.
-function memoryKV() {
-  const s = new Map(), h = new Map();
-  const hash = (k) => { if (!h.has(k)) h.set(k, new Map()); return h.get(k); };
-  return {
-    get: async (k) => (s.has(k) ? s.get(k) : null),
-    set: async (k, v, nx) => { if (nx === 'NX' && s.has(k)) return null; s.set(k, String(v)); return 'OK'; },
-    del: async (...ks) => { ks.forEach((k) => { s.delete(k); h.delete(k); }); },
-    hget: async (k, f) => (h.get(k)?.get(f) ?? null),
-    hset: async (k, f, v) => { hash(k).set(f, String(v)); },
-    hdel: async (k, f) => { h.get(k)?.delete(f); },
-    hgetall: async (k) => Object.fromEntries(h.get(k) || []),
-    hlen: async (k) => (h.get(k)?.size || 0),
-    hincrby: async (k, f, n) => { const m = hash(k); const v = parseInt(m.get(f) || '0', 10) + n; m.set(f, String(v)); return v; },
-    expire: async () => {}
-  };
-}
-
-function redisKV(r) {
-  return {
-    get: (k) => r.get(k),
-    set: (k, v, nx) => (nx === 'NX' ? r.set(k, v, 'NX') : r.set(k, v)),
-    del: (...ks) => r.del(...ks),
-    hget: (k, f) => r.hget(k, f),
-    hset: (k, f, v) => r.hset(k, f, v),
-    hdel: (k, f) => r.hdel(k, f),
-    hgetall: (k) => r.hgetall(k),
-    hlen: (k) => r.hlen(k),
-    hincrby: (k, f, n) => r.hincrby(k, f, n),
-    expire: (k, s) => r.expire(k, s)
-  };
-}
+const { createKV } = require('./kv');
 
 const normEmail = (e) => String(e || '').trim().toLowerCase();
 const domainOf = (e) => normEmail(e).split('@')[1] || '';
@@ -86,7 +57,7 @@ function newInviteCode() {
 const normCode = (c) => String(c || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
 
 function createOrgStore(redisClient, opts = {}) {
-  const kv = redisClient ? redisKV(redisClient) : memoryKV();
+  const kv = createKV(redisClient);
   const defaultSeats = opts.defaultSeatLimit || 10;
   const selfServeActive = !!opts.selfServeActive;
 
@@ -231,12 +202,12 @@ function createOrgStore(redisClient, opts = {}) {
     }
     await removeMember(org.id, user.uid);
     if (!others.length) await deleteOrg(org);
-    return { left: true, orgId: org.id };
+    return { left: true, orgId: org.id, orgDeleted: !others.length };
   }
 
   async function deleteOrg(org) {
     await kv.hdel(K.index, org.id);
-    const keys = [K.org(org.id), K.members(org.id)];
+    const keys = [K.org(org.id), K.members(org.id), K.priceList(org.id)];
     if (org.inviteCode) keys.push(K.invite(org.inviteCode));
     if (org.domain) keys.push(K.domain(org.domain));
     await kv.del(...keys);
@@ -291,6 +262,14 @@ function createOrgStore(redisClient, opts = {}) {
     return org;
   }
 
+  // Company price list (plain text the admin pastes in; never required).
+  async function getPriceList(orgId) {
+    return (await kv.get(K.priceList(orgId))) || '';
+  }
+  async function setPriceList(orgId, text) {
+    if (text) await kv.set(K.priceList(orgId), text); else await kv.del(K.priceList(orgId));
+  }
+
   async function listAll() {
     const ids = Object.keys(await kv.hgetall(K.index) || {});
     return (await Promise.all(ids.map(getOrg))).filter(Boolean);
@@ -298,7 +277,8 @@ function createOrgStore(redisClient, opts = {}) {
 
   return {
     kv, getOrg, getMember, listMembers, createOrg, setDomain, rotateInvite, joinWithCode, resolveUser,
-    leave, removeMember, setRole, recordUsage, monthUsage, update, bootstrap, deleteOrg, listAll
+    leave, removeMember, setRole, recordUsage, monthUsage, update, bootstrap, deleteOrg, listAll,
+    getPriceList, setPriceList
   };
 }
 
