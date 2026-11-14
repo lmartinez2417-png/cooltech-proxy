@@ -143,7 +143,7 @@ Once the new one is working, delete the old Railway service to avoid confusion.
 - **Server-built prompts** (`prompts.js`): the app sends only skill, Pro mode (fast/guided),
   service, language, text (≤2000), readings/data-plate fields (≤60 chars each), up to 5
   photos (JPEG/PNG/WebP, ≤~1.5 MB each) and a follow-up history (≤12 alternating turns,
-  question ≤500). Old-style `system`/`messages` bodies are refused (426).
+  question ≤500, each earlier message ≤8000 chars). Old-style `system`/`messages` bodies are refused (426).
 - **Data plate scan**: `POST /dataplate` → structured JSON (unknown values are `null`)
 - **Model lock**: model is set on the server (`ANTHROPIC_MODEL`)
 - **Size limit**: 10MB max request body

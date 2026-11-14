@@ -27,8 +27,8 @@ const LIMITS = {
   text: 2000,            // problem description
   question: 500,         // one follow-up question
   historyTurns: 12,      // previous follow-up messages kept
-  historyText: 4000,     // per previous message
-  totalText: 24000,      // everything combined
+  historyText: 8000,     // per previous message (a full diagnosis can be ~7k chars)
+  totalText: 40000,      // everything combined
   photos: 5,
   photoB64: 2_000_000,   // ~1.5 MB image per photo (base64 chars)
   field: 60              // each reading / data-plate field
