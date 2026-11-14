@@ -41,6 +41,13 @@ In Railway dashboard → your service → **Variables** tab:
 | `TRIAL_DAILY_CAP` | `10` | No (default: 10) — max diagnoses per user per day during the trial |
 | `FREE_MONTHLY` | `3` | No (default: 3) — free diagnoses per 30 days after the trial |
 | `GLOBAL_DAILY_CAP` | `2000` | No (default: 2000) — max diagnoses per day across ALL users |
+| `TEAM_DAILY_CAP` | `100` | No (default: 100) — max AI requests per company member per day |
+| `PLATE_DAILY_CAP` | `30` | No (default: 30) — max data plate scans per user per day |
+| `ORG_BOOTSTRAP` | JSON (see Team mode) | No — seeds your first company on startup |
+| `ORG_DEFAULT_SEATS` | `10` | No — seat limit for companies created in the app |
+| `ORG_SELF_SERVE_ACTIVE` | `false` | No — `true` makes app-created companies active immediately |
+| `PLATFORM_ADMIN_EMAILS` | `leo@infinityaircool.com` | No — verified emails allowed to use `/admin/orgs` |
+| `ANTHROPIC_MODEL` | `claude-sonnet-4-20250514` | No — model id |
 | `STRIPE_PAYMENT_LINK` | `https://buy.stripe.com/...` | No (add when ready) |
 | `ALLOWED_ORIGINS` | `https://yourdomain.com` | No (has built-in defaults) |
 
@@ -62,7 +69,58 @@ message until midnight UTC.
 - **Railway:** project → **Settings → Usage**: set a **usage limit / alert** so a
   traffic spike can't run up hosting costs.
 
-### Step 6: Update Your App
+### Step 6: Team mode (companies) — Infinity Air first
+
+FixIt AI supports companies ("organizations"). Members of an **active** company
+skip the free trial / monthly limits (they still have `TEAM_DAILY_CAP` per person
+per day and the global cap). Roles: **admin** (creates the company, invite code,
+removes techs, sees usage) and **tech**.
+
+Companies live in the same Redis as the limits (no extra service, and no Firebase
+service-account key needed — the proxy only verifies sign-in tokens). **Redis is
+required** for team mode in production; without it companies vanish on restart.
+
+**Seed Infinity Air** — add this Railway variable (one line):
+```
+ORG_BOOTSTRAP={"id":"infinity-air","name":"Infinity Air Heating and Cooling","domain":"infinityaircool.com","adminEmail":"leo@infinityaircool.com","seatLimit":25}
+```
+On startup the proxy creates the company if it doesn't exist (it never wipes
+members on later restarts). Then:
+1. Leo signs in to the app with **leo@infinityaircool.com** and verifies the email
+   (Settings → Team → "Send verification email", or use Google sign-in on the web).
+   He becomes the company admin automatically.
+2. Techs either sign in with a verified **@infinityaircool.com** email (auto-join), or
+   sign in with any email and enter the **invite code** shown to Leo in Settings → Team.
+3. Removing a tech: Settings → Team → member → Remove. Rotate the invite code if
+   it was shared widely.
+
+**Other HVAC companies** can tap "Create company" in Settings → Team. New
+companies start **inactive** (normal free limits) so nobody can skip the limits
+for free. Activate one when they've paid (billing is a TODO — the `active`/`plan`
+flags are where a payment webhook will plug in):
+```bash
+railway run node scripts/org-admin.js list
+railway run node scripts/org-admin.js activate <orgId>
+railway run node scripts/org-admin.js seats <orgId> 15
+```
+or `POST /admin/orgs/<orgId>` with `{"active":true}` while signed in as a
+`PLATFORM_ADMIN_EMAILS` user.
+
+### Step 7: Firebase settings
+- Authentication → Sign-in method: Email/Password ON; Google ON (web only for now —
+  the native app hides Google until the Capacitor Firebase plugin is added).
+- Authentication → Templates: check the **email verification** template (needed for
+  domain auto-join and the bootstrap admin).
+- Authentication → Settings → Authorized domains: your web domains.
+- Account deletion happens in the app (Settings → Delete account): it deletes the
+  Firebase user and calls `DELETE /me` to remove server-side usage data.
+
+### Step 8: Deploy the app and proxy together
+This proxy builds the AI prompts itself. Old app builds that send `system`/`messages`
+get **HTTP 426 "please update"**. Deploy the updated `index.html` (web + app builds)
+at the same time as this proxy.
+
+### Step 9: Update Your App
 Once deployed, Railway gives you a URL like `https://fixit-ai-proxy-production-XXXX.up.railway.app`
 
 Update the PROXY constant in your `index.html`:
@@ -70,7 +128,7 @@ Update the PROXY constant in your `index.html`:
 const PROXY = 'https://your-new-railway-url.up.railway.app';
 ```
 
-### Step 7: Delete the Old Proxy
+### Step 10: Delete the Old Proxy
 Once the new one is working, delete the old Railway service to avoid confusion.
 
 ## What This Proxy Does
@@ -80,10 +138,15 @@ Once the new one is working, delete the old Railway service to avoid confusion.
 - **After the trial**: 3 free diagnoses per 30 days per user (`FREE_MONTHLY`)
 - **Burst protection**: 3 requests/minute per user
 - **Global circuit breaker**: at most `GLOBAL_DAILY_CAP` (default 2000) diagnoses/day across all users
-- **Paid users**: not recognized yet — see the TODO in `server.js` (`trialDailyLimiter` / `freeLimiter`)
-- **Input validation**: Max 10K chars text, max 5 images, max 2000 tokens
-- **Model lock**: Only allows Claude Sonnet (prevents model switching attacks)
-- **Size limit**: 2MB max request body (prevents text bombs; fits ~5 images)
+- **Team mode**: active-company members skip trial/monthly limits; `TEAM_DAILY_CAP` per person per day
+- **Paid users**: not recognized yet — see `isPaid()` in `server.js`
+- **Server-built prompts** (`prompts.js`): the app sends only skill, Pro mode (fast/guided),
+  service, language, text (≤2000), readings/data-plate fields (≤60 chars each), up to 5
+  photos (JPEG/PNG/WebP, ≤~1.5 MB each) and a follow-up history (≤12 alternating turns,
+  question ≤500). Old-style `system`/`messages` bodies are refused (426).
+- **Data plate scan**: `POST /dataplate` → structured JSON (unknown values are `null`)
+- **Model lock**: model is set on the server (`ANTHROPIC_MODEL`)
+- **Size limit**: 10MB max request body
 - **Security headers**: Helmet.js adds standard security headers
 - **CORS**: Configurable allowed origins
 - **Cost control**: Caps max_tokens at 2000 per request
@@ -93,5 +156,30 @@ Once the new one is working, delete the old Railway service to avoid confusion.
 npm install
 npm test   # automated tests (Redis, Firebase and Anthropic are mocked)
 ANTHROPIC_API_KEY=sk-ant-... FIREBASE_PROJECT_ID=your-project-id node server.js
-# Then: curl -X POST http://localhost:3000/ai -H "Content-Type: application/json" -d '{"system":"test","messages":[{"role":"user","content":[{"type":"text","text":"hello"}]}]}'
+# Then (needs a real Firebase ID token):
+# curl -X POST http://localhost:3000/ai -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+#   -d '{"skill":"pro","proMode":"fast","serviceId":"hvac","lang":"en","text":"AC not cooling"}'
+```
+
+## API (for the app and future integrations)
+| Method | Path | What |
+|---|---|---|
+| POST | `/ai` | Diagnosis / follow-up. Response: `{content, usage, account}` |
+| POST | `/dataplate` | `{photo:{mime,data}}` → `{plate:{brand, model, serial, tonnage, ...}}` |
+| GET | `/me` | Plan, remaining quota (`quota.limit/used/remaining/resetAt`), company + role |
+| DELETE | `/me` | Delete server-side data (account deletion) |
+| POST | `/org` | Create company `{name, domain?}` (caller = admin) |
+| POST | `/org/join` | `{code}` |
+| POST | `/org/leave` | Leave company |
+| PATCH | `/org/me` | `{name}` — your name for the member list / reports |
+| GET | `/org/members` | Admin: members + usage today / this month |
+| DELETE | `/org/members/:uid` | Admin: remove a tech |
+| POST | `/org/members/:uid/role` | Admin: `{role:"admin"|"tech"}` |
+| POST | `/org/invite/rotate` | Admin: new invite code |
+| PATCH | `/org` | Admin: `{name?, logo?}` (logo = PNG/JPEG data URL ≤150 KB, used on PDF reports) |
+| GET/POST | `/admin/orgs`, `/admin/orgs/:id` | Platform admin: list / `{active, seatLimit, plan, domain}` |
+
+Limit errors are `429` with `{error:{message,type}, limit, resetAt}`; types:
+`daily_limit`, `monthly_limit_reached`, `team_daily_limit`, `plate_daily_limit`,
+`burst_limit_exceeded`, `service_busy`.
 ```
