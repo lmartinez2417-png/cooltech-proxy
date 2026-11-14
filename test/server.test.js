@@ -37,6 +37,11 @@ function startServer(env = {}) {
     auth: () => ({
       verifyIdToken: async (token) => {
         if (token.startsWith('good-')) return { uid: token.slice(5), email: 'a@b.c' };
+        // verified-<uid>|<email> → a user with a verified email
+        if (token.startsWith('verified-')) {
+          const [uid, email] = token.slice(9).split('|');
+          return { uid, email, email_verified: true };
+        }
         throw Object.assign(new Error('bad token'), { code: 'auth/argument-error' });
       }
     })
@@ -46,7 +51,7 @@ function startServer(env = {}) {
 
 const withRedis = (env = {}) => startServer({ REDIS_URL, ...env });
 
-const body = { system: 'You are an HVAC tech.', messages: [{ role: 'user', content: 'AC not cooling' }] };
+const body = { skill: 'pro', serviceId: 'hvac', lang: 'en', text: 'AC not cooling' };
 const ask = (app, uid) => request(app).post('/ai').set('Authorization', `Bearer good-${uid}`).send(body);
 
 beforeEach(async () => {
@@ -98,7 +103,7 @@ describe('existing behavior', () => {
   });
 
   test('invalid input still returns 400', async () => {
-    const res = await request(withRedis()).post('/ai').set('Authorization', 'Bearer good-bob').send({ messages: [] });
+    const res = await request(withRedis()).post('/ai').set('Authorization', 'Bearer good-bob').send({ text: '' });
     expect(res.status).toBe(400);
   });
 

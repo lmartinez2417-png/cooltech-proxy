@@ -8,6 +8,8 @@
  *   fixit:trial:start:<uid>               — trial start timestamp (ms), never expires
  *   fixit:trial:daily:<YYYY-MM-DD>:<uid>  — requests during trial that UTC day
  *   fixit:global:daily:<YYYY-MM-DD>       — requests across ALL users that UTC day
+ *   fixit:team:daily:<YYYY-MM-DD>:<uid>   — requests by a team (org) member that UTC day
+ *   fixit:plate:daily:<YYYY-MM-DD>:<uid>  — data plate scans by a user that UTC day
  * (The express-rate-limit stores in server.js use fixit:rl:burst: and fixit:rl:monthly:)
  */
 
@@ -15,6 +17,8 @@ const KEY_PREFIX = {
   trialStart: 'fixit:trial:start:',
   trialDaily: 'fixit:trial:daily:',
   globalDaily: 'fixit:global:daily:',
+  teamDaily: 'fixit:team:daily:',
+  plateDaily: 'fixit:plate:daily:',
   burst: 'fixit:rl:burst:',
   monthly: 'fixit:rl:monthly:'
 };
@@ -50,6 +54,14 @@ function createUsageStore(redisClient) {
         const count = await redisClient.incr(key);
         if (count === 1) await redisClient.expire(key, DAILY_TTL_SECONDS);
         return count;
+      },
+
+      async getDaily(key) {
+        return parseInt(await redisClient.get(key), 10) || 0;
+      },
+
+      async deleteKeys(keys) {
+        if (keys.length) await redisClient.del(...keys);
       }
     };
   }
@@ -75,6 +87,18 @@ function createUsageStore(redisClient) {
       const count = (counters.get(key) || 0) + 1;
       counters.set(key, count);
       return count;
+    },
+
+    async getDaily(key) {
+      if (todayUTC() !== countersDay) return 0;
+      return counters.get(key) || 0;
+    },
+
+    async deleteKeys(keys) {
+      for (const k of keys) {
+        counters.delete(k);
+        if (k.startsWith(KEY_PREFIX.trialStart)) trialStarts.delete(k.slice(KEY_PREFIX.trialStart.length));
+      }
     }
   };
 }
