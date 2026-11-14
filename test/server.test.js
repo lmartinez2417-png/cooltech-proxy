@@ -202,12 +202,12 @@ describe('trial daily cap', () => {
 });
 
 describe('global daily circuit breaker', () => {
-  test('returns 503 service_busy for everyone once GLOBAL_DAILY_CAP is hit', async () => {
+  test('returns 429 service_busy for everyone once GLOBAL_DAILY_CAP is hit', async () => {
     const app = withRedis({ GLOBAL_DAILY_CAP: '2' });
     expect((await ask(app, 'u1')).status).toBe(200);
     expect((await ask(app, 'u2')).status).toBe(200);
     const res = await ask(app, 'u3');
-    expect(res.status).toBe(503);
+    expect(res.status).toBe(429);
     expect(res.body.error).toEqual({
       message: 'FixIt AI is very busy right now. Please try again later.',
       type: 'service_busy'

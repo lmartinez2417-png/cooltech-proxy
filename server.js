@@ -239,7 +239,7 @@ async function globalDailyBreaker(req, res, next) {
       } else if (count % 100 === 0) {
         console.error(`🚨 GLOBAL DAILY CAP still active: ${count} requests blocked/attempted today.`);
       }
-      return res.status(503).json({
+      return res.status(429).json({
         error: {
           message: 'FixIt AI is very busy right now. Please try again later.',
           type: 'service_busy'
