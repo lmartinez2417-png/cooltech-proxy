@@ -368,3 +368,25 @@ describe('organizations (team mode)', () => {
     expect((await get(app, '/me', 'l1')).body.org.logo).toMatch(/^data:image\/png/);
   });
 });
+
+describe('result format (parsed into cards by the app)', () => {
+  const { buildSystemPrompt } = require('../prompts');
+  test('every skill/mode asks for the canonical English headings', () => {
+    const cases = [
+      { skill: 'pro', proMode: 'fast', heads: ['CAUSE:', 'CONFIDENCE:', 'SAFETY:', 'STEPS:', 'PARTS:', 'NOTES:', 'QUESTIONS:'] },
+      { skill: 'pro', proMode: 'guided', heads: ['CAUSE:', 'SAFETY:', 'NEXT STEP:', 'WHY:', 'REPORT BACK:'] },
+      { skill: 'maintenance', heads: ['CAUSE:', 'SAFETY:', 'STEPS:', 'PARTS:', 'NOTES:'] },
+      { skill: 'homeowner', heads: ['CAUSE:', 'SAFETY:', 'TRY:', 'CALL A PRO:', 'COST:'] }
+    ];
+    for (const c of cases) {
+      const p = buildSystemPrompt({ skill: c.skill, proMode: c.proMode, serviceId: 'hvac', lang: 'en' });
+      for (const h of c.heads) expect(p).toContain('\n' + h + '\n');
+      expect(p).toContain('OUTPUT FORMAT');
+    }
+  });
+  test('Spanish keeps the English headings', () => {
+    const p = buildSystemPrompt({ skill: 'pro', proMode: 'fast', serviceId: 'hvac', lang: 'es' });
+    expect(p).toMatch(/Keep the section headings exactly as written in English/);
+    expect(p).not.toMatch(/including headings/);
+  });
+});
