@@ -51,7 +51,7 @@ In Railway dashboard → your service → **Variables** tab:
 | `ORG_DEFAULT_SEATS` | `10` | No — seat limit for companies created in the app |
 | `ORG_SELF_SERVE_ACTIVE` | `false` | No — `true` makes app-created companies active immediately |
 | `PLATFORM_ADMIN_EMAILS` | `leo@infinityaircool.com` | No — verified emails allowed to use `/admin/orgs` |
-| `ANTHROPIC_MODEL` | `claude-sonnet-4-20250514` | No — model id |
+| `ANTHROPIC_MODEL` | `claude-sonnet-4-6` | No — model id |
 | `STRIPE_PAYMENT_LINK` | `https://buy.stripe.com/...` | No (add when ready) |
 | `ALLOWED_ORIGINS` | `https://yourdomain.com` | No (has built-in defaults) |
 

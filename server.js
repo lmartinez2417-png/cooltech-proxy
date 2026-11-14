@@ -34,7 +34,7 @@
  *   ORG_SELF_SERVE_ACTIVE — Optional. "true" = companies created in the app are active
  *                          immediately (default: inactive until you activate them)
  *   PLATFORM_ADMIN_EMAILS — Optional. Comma-separated verified emails allowed to use /admin/orgs
- *   ANTHROPIC_MODEL     — Optional. Model id (default: claude-sonnet-4-20250514)
+ *   ANTHROPIC_MODEL     — Optional. Model id (default: claude-sonnet-4-6)
  *   FAULT_DAILY_CAP     — Optional. Max fault-code lookups per user per UTC day (default: 30)
  *   GAUGE_DAILY_CAP     — Optional. Max gauge/meter photo reads per user per UTC day (default: 40)
  *   CLOSEOUT_DAILY_CAP  — Optional. Max close-out write-ups per user per UTC day (default: 30)
@@ -205,7 +205,7 @@ const GAUGE_DAILY_CAP = parseInt(process.env.GAUGE_DAILY_CAP) || 40;
 const CLOSEOUT_DAILY_CAP = parseInt(process.env.CLOSEOUT_DAILY_CAP) || 30;
 const ASK_DAILY_CAP = parseInt(process.env.ASK_DAILY_CAP) || 20;
 const GLOBAL_DAILY_CAP = parseInt(process.env.GLOBAL_DAILY_CAP) || 2000;
-const MODEL = process.env.ANTHROPIC_MODEL || 'claude-sonnet-4-20250514';
+const MODEL = process.env.ANTHROPIC_MODEL || 'claude-sonnet-4-6';
 const PLATFORM_ADMIN_EMAILS = (process.env.PLATFORM_ADMIN_EMAILS || '')
   .split(',').map((e) => e.trim().toLowerCase()).filter(Boolean);
 
